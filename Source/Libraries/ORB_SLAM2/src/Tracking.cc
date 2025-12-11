@@ -44,6 +44,11 @@
 #include <mutex>
 #include <thread>
 
+#include <fstream>   // ofstream
+#include <memory>    // unique_ptr
+#include <cstdlib>   // std::getenv
+#include <atomic>
+
 using namespace ::std;
 
 namespace {
@@ -55,6 +60,51 @@ namespace {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   }
 }
+
+
+
+// === 放在 Tracking.cc 顶部匿名命名空间里（已有的位置直接替换）===
+namespace {
+    std::mutex g_csv_mtx;
+    std::ofstream g_csv;
+    bool g_csv_ready = false;
+
+    // 可选：一个小工具把状态转成字符串（如果想在别处用）
+    inline const char* state_to_cstr(ORB_SLAM2::Tracking::eTrackingState s) {
+        switch (s) {
+        case ORB_SLAM2::Tracking::NOT_INITIALIZED: return "INIT";
+        case ORB_SLAM2::Tracking::OK:              return "OK";
+        case ORB_SLAM2::Tracking::LOST:            return "LOST";
+        default:                                    return "N/A";
+        }
+    }
+
+    // 统一写 CSV：多了 state 与 match_src
+    void append_frame_stats_csv(int frame_id,
+        const char* state_str,
+        int feats,
+        int matches,
+        int inliers,
+        const char* match_src)
+    {
+        std::lock_guard<std::mutex> lk(g_csv_mtx);
+        if (!g_csv_ready) {
+            g_csv.open("frame_stats.csv", std::ios::out | std::ios::app);
+            if (g_csv.tellp() == 0) {
+                g_csv << "frame_id,state,keypoints_sum,matches,pose_inliers,match_src\n";
+            }
+            g_csv_ready = true;
+        }
+        g_csv << frame_id << "," << state_str << ","
+            << feats << "," << matches << "," << inliers << ","
+            << match_src << "\n";
+        g_csv.flush();
+    }
+}
+
+
+
+
 
 namespace ORB_SLAM2 {
 
@@ -206,7 +256,17 @@ Tracking::Tracking(System *pSys, std::vector<FbowVocabulary *> pVoc, std::vector
 
   // Initialize Performance Recorder
   Perf::init(Ntype);
+
+
+
+
+  // --- init per-frame stats holders (new) ---
+  mRawMatchesToLastThisFrame = -1;
+  mRawMatchesToRefKFThisFrame = -1;
+  mInliersPoseThisFrame = -1;
+  mUsedMotionModelThisFrame = false;
 }
+
 
 void Tracking::SetLocalMapper(LocalMapping *pLocalMapper) {
   mpLocalMapper = pLocalMapper;
@@ -329,6 +389,26 @@ void Tracking::Track() {
 
   mLastProcessedState = mState;
 
+
+
+  // [ADD] 每帧初始化默认值，保证失败/LOST 也能写出 0
+  mRawMatchesToLastThisFrame = 0;
+  mRawMatchesToRefKFThisFrame = 0;
+  mInliersPoseThisFrame = 0;
+  mUsedMotionModelThisFrame = false;
+
+
+  // [ADD] 统计“本帧特征点总数”（构造 Frame 时已提完特征）
+  int feat_sum = 0;
+  for (int Ftype = 0; Ftype < Ntype; ++Ftype)
+      feat_sum += static_cast<int>(mCurrentFrame.Channels[Ftype].mvKeys.size());
+  mKeypointsSumThisFrame = feat_sum;
+
+
+
+
+
+
   // Get Map Mutex -> Map cannot be changed
   unique_lock<mutex> lock(mpMap->mMutexMapUpdate);
 
@@ -382,8 +462,33 @@ void Tracking::Track() {
     for (int Ftype = 0; Ftype < Ntype; Ftype++)
       mpFrameDrawer[Ftype]->Update(this);
 
-    if (mState != OK)
-      return;
+    if (mState != OK) {
+        const int matches = mUsedMotionModelThisFrame ? mRawMatchesToLastThisFrame
+            : mRawMatchesToRefKFThisFrame;
+
+        std::cout << "[Frame " << mCurrentFrame.mnId << "] "
+            << "state=INIT, features=" << mKeypointsSumThisFrame
+            << ", matches=" << matches
+            << ", inliers=" << mInliersPoseThisFrame
+            << std::endl;
+
+        const char* state_str = "INIT";
+        const char* src = mUsedMotionModelThisFrame ? "MM" : "RefKF";
+
+        append_frame_stats_csv(
+            static_cast<int>(mCurrentFrame.mnId),
+            state_str,
+            mKeypointsSumThisFrame,
+            matches,
+            mInliersPoseThisFrame,
+            src
+        );
+
+        ++mCountInit;   // 统计 INIT 帧数
+        return;
+    }
+
+
   } else {
 	Perf::Scoped __perf__("Tracking");
 
@@ -628,6 +733,11 @@ void Tracking::Track() {
     mLastFrame = Frame(mCurrentFrame);
   }
 
+
+
+
+
+
   // Store frame pose information to retrieve the complete camera trajectory afterwards.
   if (!mCurrentFrame.mTcw.empty()) {
     cv::Mat Tcr = mCurrentFrame.mTcw * mCurrentFrame.mpReferenceKF->GetPoseInverse();
@@ -642,6 +752,43 @@ void Tracking::Track() {
     mlFrameTimes.push_back(mlFrameTimes.back());
     mlbLost.push_back(mState == LOST);
   }
+
+  // [ADD] 统一的每帧控制台输出 + CSV 记录（OK 或 LOST）
+  {
+      const int matches = mUsedMotionModelThisFrame
+          ? mRawMatchesToLastThisFrame
+          : mRawMatchesToRefKFThisFrame;
+
+      const char* state_str = (mState == OK) ? "OK"
+          : (mState == LOST) ? "LOST"
+          : "INIT";
+
+      std::cout << "[Frame " << mCurrentFrame.mnId << "] "
+          << "state=" << state_str
+          << ", features=" << mKeypointsSumThisFrame
+          << ", matches=" << matches
+          << ", inliers=" << mInliersPoseThisFrame
+          << std::endl;
+
+      
+      const char* src = mUsedMotionModelThisFrame ? "MM" : "RefKF";
+
+      append_frame_stats_csv(
+          static_cast<int>(mCurrentFrame.mnId),
+          state_str,
+          mKeypointsSumThisFrame,
+          matches,
+          mInliersPoseThisFrame,
+          src
+      );
+
+      if (mState == OK)        ++mCountOK;
+      else if (mState == LOST) ++mCountLost;
+      // INIT 在初始化分支已 ++ 过并 return
+  }
+
+
+
 }
 
 void Tracking::StereoInitialization(const int Ftype) {
@@ -1066,6 +1213,8 @@ void Tracking::MonocularInitializationMultiChannels() {
         fill(mvIniMatches[Ftype].begin(), mvIniMatches[Ftype].end(), -1);
       
       return;
+
+
     }
   } else {
     // Sum numbers of keys
@@ -1091,6 +1240,16 @@ void Tracking::MonocularInitializationMultiChannels() {
     int nmatchesSum = 0;
     for (int Ftype = 0; Ftype < Ntype; Ftype++)
       nmatchesSum += nmatches[Ftype];
+
+
+
+    // [ADD] 把 INIT 阶段的“原始匹配数（与上一帧）”写进去，供 Track() 的INIT日志/CSV使用
+    mRawMatchesToLastThisFrame = nmatchesSum;
+    mUsedMotionModelThisFrame = true;
+
+
+
+
     
     // Check if there are enough correspondences
     if (nmatchesSum < 100) {
@@ -1355,8 +1514,15 @@ bool Tracking::TrackWithMotionModelMultiChannels() {
       nmatchesSum += nmatches[Ftype];
   }
   
-  if (nmatchesSum < 20)
-    return false;
+  // [ADD] 原始匹配数（未优化、未剔除外点），来源=与上一帧（Motion Model）
+  mRawMatchesToLastThisFrame = nmatchesSum;
+  mUsedMotionModelThisFrame = true;
+
+
+  if (nmatchesSum < 20) {
+      mInliersPoseThisFrame = 0;
+      return false;
+  }
 
   // Optimize frame pose with all matches
   Optimizer::PoseOptimizationMultiChannels(&mCurrentFrame);
@@ -1381,6 +1547,24 @@ bool Tracking::TrackWithMotionModelMultiChannels() {
     }
   }
 
+
+
+  // [ADD] 统计位姿优化后的内点（所有通道、非外点）
+  {
+      int inliers = 0;
+      for (int Ftype = 0; Ftype < Ntype; ++Ftype) {
+          for (int i = 0; i < mCurrentFrame.Channels[Ftype].N; ++i) {
+              if (mCurrentFrame.Channels[Ftype].mvpMapPoints[i] &&
+                  !mCurrentFrame.Channels[Ftype].mvbOutlier[i]) {
+                  ++inliers;
+              }
+          }
+      }
+      mInliersPoseThisFrame = inliers;
+  }
+
+
+
   if (mbOnlyTracking) {
     mbVO = nmatchesMap < 10;
     return nmatchesSum > 20;
@@ -1393,7 +1577,11 @@ bool Tracking::TrackReferenceKeyFrameMultiChannels() {
   // Compute Bag of Words vector
   for (int Ftype = 0; Ftype < Ntype; Ftype++) 
     mCurrentFrame.ComputeBoW(Ftype);
-  
+
+  // [ADD] 本分支使用“参考关键帧”而不是“运动模型”
+  mUsedMotionModelThisFrame = false;
+
+
   // Assocaiter
   Associater associater(0.7, true);
   vector<vector<MapPoint *>> vvpMapPointMatches;
@@ -1408,18 +1596,53 @@ bool Tracking::TrackReferenceKeyFrameMultiChannels() {
   // sum of all matches
   int nmatchesSum = 0;
   for (int Ftype = 0; Ftype < Ntype; Ftype++)
-    nmatchesSum += nmatches[Ftype];
+      nmatchesSum += nmatches[Ftype];
+
+
+
+  // [ADD] 保存“原始匹配数（对参考关键帧）”
+  mRawMatchesToRefKFThisFrame = nmatchesSum;
+
+
+
+
+  if (nmatchesSum < 15) {
+      mInliersPoseThisFrame = 0; // 没有有效位姿内点
+      return false;
+  }
+
   
-  if (nmatchesSum < 15)
-    return false;
 
   for (int Ftype = 0; Ftype < Ntype; Ftype++) 
     mCurrentFrame.Channels[Ftype].mvpMapPoints = vvpMapPointMatches[Ftype];
   
   mCurrentFrame.SetPose(mLastFrame.mTcw);
 
+
+  // 参考关键帧分支 → 没用 motion model
+  mUsedMotionModelThisFrame = false;
+
+
+
+
   Optimizer::PoseOptimizationMultiChannels(&mCurrentFrame);
   //Optimizer::PoseOptimizationMultiChannels(&mCurrentFrame);
+
+
+  // [ADD] 统计位姿优化后的内点（mvpMapPoints 非空 且 非外点）
+  {
+      int inliers = 0;
+      for (int Ftype = 0; Ftype < Ntype; ++Ftype) {
+          for (int i = 0; i < mCurrentFrame.Channels[Ftype].N; ++i) {
+              if (mCurrentFrame.Channels[Ftype].mvpMapPoints[i] &&
+                  !mCurrentFrame.Channels[Ftype].mvbOutlier[i]) {
+                  ++inliers;
+              }
+          }
+      }
+      mInliersPoseThisFrame = inliers;
+  }
+
 
   // Discard outliers
   int nmatchesMap = 0;
@@ -1439,6 +1662,9 @@ bool Tracking::TrackReferenceKeyFrameMultiChannels() {
       }
     }
   }
+
+
+
 
   return nmatchesMap >= 10;
 }

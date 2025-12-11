@@ -121,6 +121,21 @@ public:
   long unsigned int mInitlizedID;
   static ORB_SLAM2::CorrelationMatcher sMatcher;
 
+
+  // ---- stats: per-frame numbers ----
+  int  mKeypointsSumThisFrame = 0;   // 本帧特征点总数（全通道求和）
+  int  mRawMatchesToLastThisFrame = 0;   // 本帧与上一帧的“原始匹配数”（Motion Model）
+  int  mRawMatchesToRefKFThisFrame = 0;   // 本帧与参考关键帧的“原始匹配数”（BoW）
+  int  mInliersPoseThisFrame = 0;   // 本帧位姿优化后的内点数（非外点的匹配数）
+  bool mUsedMotionModelThisFrame = false; // 本帧匹配来源（true=上一帧；false=参考KF）
+
+  // ---- stats: state counters ----
+  uint64_t mCountInit = 0;
+  uint64_t mCountOK = 0;
+  uint64_t mCountLost = 0;
+
+
+
 protected:
   // Main tracking function. It is independent of the input sensor.
   void Track();
@@ -224,6 +239,7 @@ protected:
 
   // Current matches in frame
   int mnMatchesInliers;
+
 
   // Last Frame, KeyFrame and Relocalisation Info
   KeyFrame *mpLastKeyFrame;

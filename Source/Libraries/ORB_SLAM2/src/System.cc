@@ -356,6 +356,20 @@ void System::Shutdown() {
   cout << endl << "Saving correlation status..." << endl;
   ORB_SLAM2::Tracking::sMatcher.Finalize();
   cout << endl << "Correlation status saved!" << endl << endl;
+
+
+  std::cout << "\n========== Tracking State Summary ==========\n";
+  if (mpTracker) {
+      std::cout << "INIT frames: " << mpTracker->mCountInit << "\n";
+      std::cout << "OK   frames: " << mpTracker->mCountOK << "\n";
+      std::cout << "LOST frames: " << mpTracker->mCountLost << "\n";
+  }
+  else {
+      std::cout << "(no tracker)\n";
+  }
+
+
+
 }
 
 void System::SaveTrajectoryTUM(const string &filename) {
